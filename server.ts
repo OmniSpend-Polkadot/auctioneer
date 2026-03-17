@@ -46,6 +46,44 @@ interface AuctionResult {
     auctionDurationMs: number;
 }
 
+// Intent status types
+type IntentStatus =
+    | "pending"
+    | "solver_accepted"
+    | "origin_escrow_started"
+    | "origin_escrow_complete"
+    | "destination_executing"
+    | "destination_success"
+    | "destination_failed"
+    | "completed";
+
+interface IntentStep {
+    status: IntentStatus;
+    message: string;
+    txHash?: string;
+    timestamp: number;
+}
+
+interface Intent {
+    requestId: string;
+    user: string;
+    winnerAddress: string;
+    winnerName: string;
+    legs: { chain: string; chainId: number; amount: string }[];
+    destination: { chain: string; chainId: number };
+    totalOutputAmount: string;
+    nftName?: string;
+    steps: IntentStep[];
+    currentStep: number;
+    status: IntentStatus;
+    createdAt: number;
+    updatedAt: number;
+}
+
+// ============================================================
+// Storage
+// ============================================================
+
 // Track active auctions
 const activeAuctions = new Map<
     string,
@@ -54,6 +92,12 @@ const activeAuctions = new Map<
 
 // Track winning solver sockets (requestId → socket)
 const auctionWinners = new Map<string, Socket>();
+
+// Intent tracking storage (in-memory for now, can be persisted)
+const intents = new Map<string, Intent>();
+
+// User socket connections (userAddress → socket)
+const userSockets = new Map<string, Socket>();
 
 // ============================================================
 // WebSocket: Solver Namespace
@@ -84,10 +128,119 @@ solverNamespace.on("connection", (socket: Socket) => {
         }
     });
 
-    // Solver receives execute_order event — handled below in submit-signature
+    // Solver emits execution status update
+    socket.on("intent_status", (data: {
+        requestId: string;
+        status: IntentStatus;
+        message: string;
+        txHash?: string;
+    }) => {
+        console.log(`  📊 Intent ${data.requestId} status: ${data.status} - ${data.message}`);
+
+        const intent = intents.get(data.requestId);
+        if (!intent) {
+            console.log(`  ⚠️ Intent not found: ${data.requestId}`);
+            return;
+        }
+
+        // Update intent
+        intent.steps.push({
+            status: data.status,
+            message: data.message,
+            txHash: data.txHash,
+            timestamp: Date.now(),
+        });
+        intent.status = data.status;
+        intent.updatedAt = Date.now();
+
+        // Determine current step based on status
+        const stepMap: Record<IntentStatus, number> = {
+            pending: 0,
+            solver_accepted: 1,
+            origin_escrow_started: 2,
+            origin_escrow_complete: 3,
+            destination_executing: 4,
+            destination_success: 5,
+            destination_failed: -1,
+            completed: 5,
+        };
+        intent.currentStep = stepMap[data.status];
+
+        // Emit to user
+        const userSocket = userSockets.get(intent.user.toLowerCase());
+        if (userSocket && userSocket.connected) {
+            userSocket.emit("intent_update", {
+                requestId: data.requestId,
+                status: data.status,
+                message: data.message,
+                txHash: data.txHash,
+                step: intent.currentStep,
+            });
+        }
+
+        // Also emit via REST-saved userId if different
+        if (intent.user !== intent.user.toLowerCase()) {
+            const lowerUserSocket = userSockets.get(intent.user.toLowerCase());
+            if (lowerUserSocket && lowerUserSocket.connected) {
+                lowerUserSocket.emit("intent_update", {
+                    requestId: data.requestId,
+                    status: data.status,
+                    message: data.message,
+                    txHash: data.txHash,
+                    step: intent.currentStep,
+                });
+            }
+        }
+    });
 
     socket.on("disconnect", () => {
         console.log(`❌ Solver disconnected: ${solverName} [${socket.id}]`);
+    });
+});
+
+// ============================================================
+// WebSocket: Client Namespace (for frontend)
+// ============================================================
+
+const clientNamespace = io.of("/client");
+
+clientNamespace.on("connection", (socket: Socket) => {
+    const userAddress = (socket.handshake.query.address as string || "").toLowerCase();
+
+    if (userAddress) {
+        userSockets.set(userAddress, socket);
+        console.log(`\n👤 Client connected: ${userAddress} [${socket.id}]`);
+    }
+
+    // User subscribes to specific intent updates
+    socket.on("subscribe_intent", (requestId: string) => {
+        socket.join(`intent:${requestId}`);
+        console.log(`  📡 Client subscribed to intent: ${requestId}`);
+
+        // Send current intent status if exists
+        const intent = intents.get(requestId);
+        if (intent) {
+            socket.emit("intent_update", {
+                requestId: intent.requestId,
+                status: intent.status,
+                message: intent.steps[intent.steps.length - 1]?.message || "Processing...",
+                step: intent.currentStep,
+                legs: intent.legs,
+                totalOutputAmount: intent.totalOutputAmount,
+                winnerName: intent.winnerName,
+            });
+        }
+    });
+
+    socket.on("unsubscribe_intent", (requestId: string) => {
+        socket.leave(`intent:${requestId}`);
+    });
+
+    socket.on("disconnect", () => {
+        if (userAddress) {
+            userSockets.delete(userAddress);
+            console.log(`\n👤 Client disconnected: ${userAddress}`);
+        }
     });
 });
 
@@ -166,23 +319,69 @@ app.post("/api/request-quote", async (req, res) => {
  * Auctioneer forwards it ONLY to the winning solver.
  */
 app.post("/api/submit-signature", (req, res) => {
-    const { requestId, winnerAddress, signedPayload } = req.body;
+    const { requestId, winnerAddress, signedPayload, nftName, user, legs, destination, totalOutputAmount } = req.body;
 
     if (!requestId || !winnerAddress || !signedPayload) {
         res.status(400).json({ error: "Missing requestId, winnerAddress, or signedPayload" });
         return;
     }
 
+    // Create intent tracking record
+    const intent: Intent = {
+        requestId,
+        user: user?.toLowerCase() || "",
+        winnerAddress,
+        winnerName: "", // Will be filled from the auction
+        legs: legs || [],
+        destination: destination || { chain: "Polkadot", chainId: 420420417 },
+        totalOutputAmount: totalOutputAmount || "0",
+        nftName,
+        steps: [{
+            status: "pending",
+            message: "Intent submitted, waiting for solver...",
+            timestamp: Date.now(),
+        }],
+        currentStep: 0,
+        status: "pending",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+    };
+    intents.set(requestId, intent);
+
+    // Get winner name from active auctions if available
+    const auction = activeAuctions.get(requestId);
+    if (auction) {
+        const winner = auction.bids.find(b => b.solverAddress === winnerAddress);
+        if (winner) {
+            intent.winnerName = winner.solverName;
+        }
+    }
+
+    // Notify subscribed client
+    clientNamespace.to(`intent:${requestId}`).emit("intent_update", {
+        requestId,
+        status: "pending",
+        message: "Intent submitted, waiting for solver...",
+        step: 0,
+    });
+
     const winnerSocket = auctionWinners.get(`${requestId}:${winnerAddress}`);
 
     if (!winnerSocket || !winnerSocket.connected) {
         console.log(`\n⚠️  Winner socket not found for ${winnerAddress}`);
-        res.status(404).json({ error: "Winner solver not connected" });
+
+        // Still store intent but warn user
+        res.json({
+            success: true,
+            message: "Signature received, solver may be offline. Intent will be processed when solver reconnects.",
+            intentId: requestId
+        });
         return;
     }
 
     console.log(`\n🔐 ========== SIGNATURE RECEIVED ==========`);
     console.log(`   Forwarding to winner: ${winnerAddress}`);
+    console.log(`   Intent ID: ${requestId}`);
 
     // Send ONLY to the winning solver
     winnerSocket.emit("execute_order", {
@@ -190,11 +389,58 @@ app.post("/api/submit-signature", (req, res) => {
         signedPayload,
     });
 
-    // Clean up
+    // Clean up auction winner reference
     auctionWinners.delete(`${requestId}:${winnerAddress}`);
 
     console.log(`   ✅ Order forwarded exclusively to winner!`);
-    res.json({ success: true, message: "Signature forwarded to winning solver" });
+    res.json({ success: true, message: "Signature forwarded to winning solver", intentId: requestId });
+});
+
+/**
+ * GET /api/intent/:requestId
+ * Get current intent status (for polling fallback)
+ */
+app.get("/api/intent/:requestId", (req, res) => {
+    const { requestId } = req.params;
+    const intent = intents.get(requestId);
+
+    if (!intent) {
+        res.status(404).json({ error: "Intent not found" });
+        return;
+    }
+
+    res.json({
+        requestId: intent.requestId,
+        status: intent.status,
+        currentStep: intent.currentStep,
+        steps: intent.steps,
+        legs: intent.legs,
+        totalOutputAmount: intent.totalOutputAmount,
+        winnerName: intent.winnerName,
+        nftName: intent.nftName,
+        createdAt: intent.createdAt,
+        updatedAt: intent.updatedAt,
+    });
+});
+
+/**
+ * GET /api/intents/:userAddress
+ * Get all intents for a user
+ */
+app.get("/api/intents/:userAddress", (req, res) => {
+    const { userAddress } = req.params;
+    const userIntents: Intent[] = [];
+
+    intents.forEach((intent) => {
+        if (intent.user.toLowerCase() === userAddress.toLowerCase()) {
+            userIntents.push(intent);
+        }
+    });
+
+    // Sort by createdAt descending
+    userIntents.sort((a, b) => b.createdAt - a.createdAt);
+
+    res.json(userIntents);
 });
 
 // Health check
@@ -202,7 +448,9 @@ app.get("/health", (_req, res) => {
     res.json({
         status: "ok",
         connectedSolvers: solverNamespace.sockets.size,
+        connectedClients: clientNamespace.sockets.size,
         activeAuctions: activeAuctions.size,
+        trackedIntents: intents.size,
     });
 });
 
@@ -213,10 +461,11 @@ app.get("/health", (_req, res) => {
 server.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║     🏛️  OmniSpend Auctioneer Node v1.0       ║
+║     🏛️  OmniSpend Auctioneer Node v1.1        ║
 ║     Listening on http://localhost:${PORT}       ║
-║     Auction window: ${AUCTION_TIMEOUT_MS}ms                  ║
+║     Auction window: ${AUCTION_TIMEOUT_MS}ms                   ║
 ║     Solver namespace: /solver                 ║
+║     Client namespace: /client                 ║
 ╚═══════════════════════════════════════════════╝
   `);
 });
