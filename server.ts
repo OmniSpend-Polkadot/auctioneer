@@ -168,6 +168,7 @@ solverNamespace.on("connection", (socket: Socket) => {
 
         // Emit to user
         const userSocket = userSockets.get(intent.user.toLowerCase());
+        console.log(`  → Looking for user socket: ${intent.user.toLowerCase()}, found: ${!!userSocket}, connected: ${userSocket?.connected}`);
         if (userSocket && userSocket.connected) {
             userSocket.emit("intent_update", {
                 requestId: data.requestId,
@@ -176,6 +177,9 @@ solverNamespace.on("connection", (socket: Socket) => {
                 txHash: data.txHash,
                 step: intent.currentStep,
             });
+            console.log(`  ✅ Emitted to user: ${data.status}`);
+        } else {
+            console.log(`  ⚠️ User socket not found or disconnected - WebSocket update failed`);
         }
 
         // Also emit via REST-saved userId if different
